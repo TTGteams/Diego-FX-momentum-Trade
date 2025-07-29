@@ -27,6 +27,7 @@ from datetime import timedelta
 from flask import Flask, request, jsonify
 from waitress import serve
 import json
+import random
 
 # Configure logging with UTF-8 encoding to handle Unicode characters
 # Create handlers with explicit flushing
@@ -108,6 +109,10 @@ class EnhancedIBTradingBot:
         self.max_reconnection_attempts = 500  # About 42 hours with exponential backoff capped at 5 min
         self.shutdown_requested = False
         self.persistent_reconnect = True  # Never give up reconnecting
+        
+        # FIXED: Add thread synchronization for restart operations
+        self.restart_lock = threading.Lock()
+        self.restart_in_progress = False
         
         # Data monitoring
         self.last_tick_times = {currency: None for currency in self.currency_pairs.keys()}
@@ -363,7 +368,7 @@ class EnhancedIBTradingBot:
                 time.sleep(2)
             
             # Add timeout to connection attempt
-            self.ib.connect(self.ib_host, self.ib_port, clientId=self.client_id, timeout=10)
+            self.ib.connect(self.ib_host, self.ib_port, clientId=self.client_id, timeout=5)
             
             # Verify connection
             if not self.ib.isConnected():
@@ -557,11 +562,20 @@ class EnhancedIBTradingBot:
             
             threading.Thread(target=delayed_reconnect, daemon=True).start()
 
-    def restart_ib_connection(self, retry_attempt=0):
+    def restart_ib_connection(self, retry_attempt=0, is_manual_restart=False):
         """Restart IB connection with fresh instance - similar to RESTART but only for connection"""
+        # FIXED: Use thread synchronization to prevent concurrent restarts
+        if not self.restart_lock.acquire(blocking=False):
+            logger.warning("[CONNECTION_RESTART] Another restart operation already in progress, skipping...")
+            return False
+        
         try:
+            # Set restart in progress flag
+            self.restart_in_progress = True
+            
             if retry_attempt == 0:
-                logger.info("[CONNECTION_RESTART] Starting fresh IB connection restart...")
+                restart_type = "manual" if is_manual_restart else "automatic"
+                logger.info(f"[CONNECTION_RESTART] Starting fresh IB connection restart ({restart_type})...")
             else:
                 logger.info(f"[CONNECTION_RESTART] Retry attempt {retry_attempt} - Restarting connection due to no data flow...")
             
@@ -601,14 +615,22 @@ class EnhancedIBTradingBot:
             # Give TWS time to clean up old connections
             time.sleep(3)
             
-            # Cycle through predefined client IDs
-            client_id_list = [6969, 7777, 8888, 9999, 3333]
+            # FIXED: Separate client ID pools to prevent manual/automatic clashes
+            manual_client_ids = [6969, 7777, 8888]      # Manual restarts get these 3 IDs
+            automatic_client_ids = [9999, 3333]         # Automatic restarts get these 2 IDs
             
-            # Use modulo to cycle through the list based on reconnection attempts
-            id_index = self.reconnection_attempts % len(client_id_list)
-            new_client_id = client_id_list[id_index]
+            if is_manual_restart:
+                # For manual restarts, randomly select from the manual pool
+                import random
+                random.seed(int(time.time()))
+                new_client_id = random.choice(manual_client_ids)
+                logger.info(f"[CONNECTION_RESTART] Manual restart - using random client ID: {new_client_id} (from manual pool: {manual_client_ids})")
+            else:
+                # For automatic reconnection, cycle through the automatic pool
+                id_index = self.reconnection_attempts % len(automatic_client_ids)
+                new_client_id = automatic_client_ids[id_index]
+                logger.info(f"[CONNECTION_RESTART] Automatic restart - using client ID: {new_client_id} (attempt {self.reconnection_attempts + 1}, from automatic pool: {automatic_client_ids})")
             
-            logger.info(f"[CONNECTION_RESTART] Using client ID: {new_client_id} (attempt {self.reconnection_attempts + 1})")
             self.client_id = new_client_id
             
             # Attempt connection with fresh instance
@@ -619,15 +641,20 @@ class EnhancedIBTradingBot:
                 if self.setup_market_data():
                     logger.info("[CONNECTION_RESTART] Market data setup complete")
                     
-                    # Verify data flow with persistence (up to 3 minutes)
-                    logger.info("[CONNECTION_RESTART] Verifying data flow...")
+                    # FIXED: Shorter verification for manual restarts
+                    if is_manual_restart:
+                        logger.info("[CONNECTION_RESTART] Manual restart - quick data verification (30s)...")
+                        max_wait_time = 30  # Only 30 seconds for manual restarts
+                        check_interval = 5   # Check every 5 seconds
+                    else:
+                        logger.info("[CONNECTION_RESTART] Automatic restart - full data verification (3min)...")
+                        max_wait_time = 180  # 3 minutes for automatic restarts
+                        check_interval = 15  # Check every 15 seconds
                     
                     # Initial wait
                     time.sleep(3)
                     
-                    # Check for data flow every 15 seconds for up to 3 minutes
-                    max_wait_time = 180  # 3 minutes
-                    check_interval = 15  # 15 seconds
+                    # Check for data flow
                     elapsed_time = 0
                     has_fresh_data = False
                     
@@ -688,40 +715,49 @@ class EnhancedIBTradingBot:
                     if has_fresh_data:
                         return True
                     else:
-                        logger.warning(f"[CONNECTION_RESTART] Connected but no data flow after {max_wait_time}s wait")
+                        wait_description = "30 seconds" if is_manual_restart else f"{max_wait_time}s"
+                        logger.warning(f"[CONNECTION_RESTART] Connected but no data flow after {wait_description} wait")
                         
-                        # If this is the first attempt, retry the entire connection process
-                        if retry_attempt == 0:
-                            logger.warning("[CONNECTION_RESTART] No data after 3 minutes - attempting full connection restart...")
-                            return self.restart_ib_connection(retry_attempt=1)
+                        # FIXED: Different retry logic for manual vs automatic
+                        if is_manual_restart:
+                            # For manual restarts, don't retry automatically - let user decide
+                            logger.warning("[CONNECTION_RESTART] Manual restart completed but no data flow detected")
+                            logger.warning("[CONNECTION_RESTART] Connection established but waiting for market data")
+                            logger.info("[CONNECTION_RESTART] Try running STATUS command to check data flow later")
+                            return True  # Consider it successful - connection is established
                         else:
-                            # This is the second attempt, log error and give up
-                            # Get current time in MST
-                            mst_tz = pytz.timezone('America/Denver')  # MST/MDT
-                            current_time_utc = datetime.datetime.now(pytz.UTC)
-                            current_time_mst = current_time_utc.astimezone(mst_tz)
-                            mst_timestamp = current_time_mst.strftime("%Y-%m-%d %H:%M:%S MST")
-                            
-                            error_msg = (f"[CRITICAL ERROR] Connection was restarted twice but no data came in. "
-                                       f"Data officially lost at {mst_timestamp}")
-                            
-                            # Log to file
-                            logger.error("=" * 80)
-                            logger.error(error_msg)
-                            logger.error("=" * 80)
-                            
-                            # Also print to terminal for immediate visibility
-                            print("\n" + "="*80)
-                            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] CRITICAL ERROR")
-                            print(error_msg)
-                            print("="*80 + "\n")
-                            
-                            # Force flush output to ensure it's visible
-                            import sys
-                            sys.stdout.flush()
-                            sys.stderr.flush()
-                            
-                            return False  # Return False to indicate complete failure
+                            # For automatic restarts, retry once as before
+                            if retry_attempt == 0:
+                                logger.warning("[CONNECTION_RESTART] No data after 3 minutes - attempting full connection restart...")
+                                return self.restart_ib_connection(retry_attempt=1, is_manual_restart=False)
+                            else:
+                                # This is the second attempt, log error and give up
+                                # Get current time in MST
+                                mst_tz = pytz.timezone('America/Denver')  # MST/MDT
+                                current_time_utc = datetime.datetime.now(pytz.UTC)
+                                current_time_mst = current_time_utc.astimezone(mst_tz)
+                                mst_timestamp = current_time_mst.strftime("%Y-%m-%d %H:%M:%S MST")
+                                
+                                error_msg = (f"[CRITICAL ERROR] Connection was restarted twice but no data came in. "
+                                           f"Data officially lost at {mst_timestamp}")
+                                
+                                # Log to file
+                                logger.error("=" * 80)
+                                logger.error(error_msg)
+                                logger.error("=" * 80)
+                                
+                                # Also print to terminal for immediate visibility
+                                print("\n" + "="*80)
+                                print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] CRITICAL ERROR")
+                                print(error_msg)
+                                print("="*80 + "\n")
+                                
+                                # Force flush output to ensure it's visible
+                                import sys
+                                sys.stdout.flush()
+                                sys.stderr.flush()
+                                
+                                return False  # Return False to indicate complete failure
                 else:
                     logger.error("[CONNECTION_RESTART] Market data setup failed")
                     self.is_connected = False
@@ -735,6 +771,10 @@ class EnhancedIBTradingBot:
             import traceback
             logger.error(f"[CONNECTION_RESTART] Traceback: {traceback.format_exc()}")
             return False
+        finally:
+            # Always release the lock and clear the flag
+            self.restart_in_progress = False
+            self.restart_lock.release()
 
     def handle_reconnection(self):
         """Automatic reconnection with exponential backoff and fresh IB instances"""
@@ -784,10 +824,15 @@ class EnhancedIBTradingBot:
                 logger.info("[RECONNECT] Shutdown requested, stopping reconnection")
                 return
             
+            # FIXED: Check if another restart operation is already in progress
+            if self.restart_in_progress:
+                logger.warning("[RECONNECT] Another restart operation in progress, skipping automatic reconnection")
+                continue
+            
             # Use fresh connection restart for each attempt
             logger.info(f"[RECONNECT] Performing fresh connection restart (attempt {self.reconnection_attempts})")
             
-            if self.restart_ib_connection():
+            if self.restart_ib_connection(is_manual_restart=False):
                 logger.info("[RECONNECT] Fresh connection restart successful!")
                 self.reconnection_attempts = 0  # Reset counter on success
                 return
@@ -804,8 +849,13 @@ class EnhancedIBTradingBot:
                 while not self.shutdown_requested:
                     time.sleep(600)  # 10 minutes
                     
+                    # FIXED: Check if another restart operation is already in progress
+                    if self.restart_in_progress:
+                        logger.warning("[RECONNECT] Another restart operation in progress, skipping persistent reconnection")
+                        continue
+                    
                     logger.info("[RECONNECT] Persistent reconnection attempt...")
-                    if self.restart_ib_connection():
+                    if self.restart_ib_connection(is_manual_restart=False):
                         logger.info("[RECONNECT] ✅ Persistent reconnection successful!")
                         self.reconnection_attempts = 0
                         return
@@ -1419,19 +1469,25 @@ class EnhancedIBTradingBot:
         try:
             logger.info("[RECONNECT] Starting manual reconnection process...")
             
-            # Stop any ongoing automatic reconnection
-            self.shutdown_requested = True
-            time.sleep(0.5)
-            self.shutdown_requested = False
-            
-            # Reset reconnection attempts counter
-            self.reconnection_attempts = 0
+            # FIXED: Check if another restart operation is already in progress
+            if self.restart_in_progress:
+                logger.warning("[RECONNECT] Another restart operation is already in progress, waiting...")
+                # Wait up to 30 seconds for the other operation to complete
+                wait_start = time.time()
+                while self.restart_in_progress and (time.time() - wait_start) < 30:
+                    time.sleep(1)
+                
+                if self.restart_in_progress:
+                    logger.error("[RECONNECT] Another restart operation is taking too long, aborting manual reconnect")
+                    return False
+                else:
+                    logger.info("[RECONNECT] Other restart operation completed, proceeding with manual reconnect")
             
             # Clear recent prices to ensure we get fresh data
             for currency in self.recent_prices:
                 self.recent_prices[currency] = []
             
-            # Check current connection state AND data flow
+            # RESTORED: Zombie connection detection logic (improved)
             current_state = "unknown"
             has_recent_data = False
             
@@ -1453,132 +1509,75 @@ class EnhancedIBTradingBot:
                 logger.error(f"[RECONNECT] Error checking connection state: {e}")
                 current_state = "error"
             
-            # Only trust "connected" state if we also have recent data
+            # IMPROVED: Smart restart decision based on connection state
             if current_state == "connected" and has_recent_data:
-                logger.info("[RECONNECT] Already connected with active data flow - refreshing market data...")
-                # Just refresh market data (fast mode for manual reconnect)
+                logger.info("[RECONNECT] Already connected with active data flow - refreshing market data only...")
+                # Just refresh market data (faster approach for healthy connections)
                 self.recover_market_data(fast_mode=True)
-                time.sleep(2)  # Reduced wait for market data to stabilize
-            else:
-                # Either disconnected OR zombie connection (connected but no data)
-                if current_state == "connected" and not has_recent_data:
-                    logger.warning("[RECONNECT] ZOMBIE CONNECTION DETECTED - Connected but no data flow!")
-                    logger.info("[RECONNECT] Forcing full reconnection with fresh IB instance...")
+                time.sleep(2)  # Wait for market data to stabilize
+                
+                # Verify the refresh worked
+                current_time = datetime.datetime.now()
+                refresh_worked = False
+                for currency, last_tick in self.last_tick_times.items():
+                    if last_tick and (current_time - last_tick).total_seconds() < 30:
+                        refresh_worked = True
+                        break
+                
+                if refresh_worked:
+                    logger.info("[RECONNECT] ✅ Market data refresh successful!")
+                    return True
                 else:
-                    logger.info("[RECONNECT] Not connected - attempting full reconnection...")
+                    logger.warning("[RECONNECT] Market data refresh failed, will do full restart...")
+                    # Fall through to full restart
+                    
+            elif current_state == "connected" and not has_recent_data:
+                logger.warning("[RECONNECT] 🧟 ZOMBIE CONNECTION DETECTED - Connected but no data flow!")
+                logger.info("[RECONNECT] Performing full restart to fix zombie connection...")
+                # Fall through to full restart
+            else:
+                logger.info(f"[RECONNECT] Not connected (state: {current_state}) - performing full restart...")
+                # Fall through to full restart
+            
+            # Perform full restart (for disconnected or zombie connections)
+            logger.info("[RECONNECT] Performing fresh connection restart (manual)...")
+            connected = self.restart_ib_connection(is_manual_restart=True)
+            
+            if connected:
+                logger.info("[RECONNECT] ✅ Manual restart successful!")
+                # Reset reconnection attempts counter on success
+                self.reconnection_attempts = 0
+                return True
+            else:
+                logger.warning("[RECONNECT] Manual restart failed")
                 
-                # Use the new fresh connection restart method
-                logger.info("[RECONNECT] Using fresh connection restart...")
-                connected = self.restart_ib_connection()
+                # FIXED: Simplified fallback - just try force disconnect once
+                logger.info("[RECONNECT] Attempting force disconnect before one final retry...")
+                force_disconnect_result = self.force_disconnect_all_clients()
                 
+                logger.info("[RECONNECT] Waiting 5 seconds after force disconnect...")
+                time.sleep(5)
+                
+                # Try once more with fresh restart
+                connected = self.restart_ib_connection(is_manual_restart=True)
                 if connected:
-                    logger.info("[RECONNECT] Fresh connection restart successful!")
-                    # Reset reconnection attempts counter on success
+                    logger.info("[RECONNECT] ✅ Manual restart successful after force disconnect!")
                     self.reconnection_attempts = 0
+                    return True
                 else:
-                    logger.warning("[RECONNECT] Fresh connection restart failed")
+                    logger.error("[RECONNECT] ❌ Manual restart failed even after force disconnect")
+                    logger.error("[RECONNECT] Recommendations:")
+                    logger.error("[RECONNECT] 1. Check TWS/Gateway is running")
+                    logger.error("[RECONNECT] 2. Verify API settings in TWS")
+                    logger.error("[RECONNECT] 3. Try restarting TWS/Gateway")
+                    logger.error("[RECONNECT] 4. Use FORCE_DISCONNECT to clear any remaining zombie connections")
+                    return False
                     
-                    # If first attempt failed, try with force disconnect and different client IDs
-                    logger.info("[RECONNECT] Attempting force disconnect before retry...")
-                    force_disconnect_result = self.force_disconnect_all_clients()
-                    
-                    if "Disconnected" in force_disconnect_result and "zombie connections" in force_disconnect_result:
-                        logger.info("[RECONNECT] Cleared zombie connections, waiting 5 seconds...")
-                        time.sleep(5)
-                        
-                        # Try once more with fresh restart
-                        connected = self.restart_ib_connection()
-                        if connected:
-                            logger.info("[RECONNECT] Connection successful after clearing zombies!")
-                            self.reconnection_attempts = 0
-                
-                if not connected:
-                        # Get more specific error info
-                        error_msg = "[RECONNECT] Failed to connect to IB.\n"
-                        error_msg += "Troubleshooting:\n"
-                        error_msg += f"1. Check TWS/Gateway is running on port {self.ib_port}\n"
-                        error_msg += "2. Verify API connections are enabled in TWS (File > Global Configuration > API > Settings)\n"
-                        error_msg += f"3. Current client ID: {self.client_id}\n"
-                        error_msg += "4. Try restarting TWS/Gateway\n"
-                        error_msg += "5. Force disconnect zombie connections: send_command.py FORCE_DISCONNECT\n"
-                        error_msg += "Check ib_trading_enhanced.log for detailed error messages."
-                        return error_msg
-            
-            # Check if we're getting data and build status report
-            status_lines = []
-            status_lines.append("\n[RECONNECT STATUS REPORT]")
-            status_lines.append("=" * 50)
-            
-            # Connection status with verification
-            connection_verified = False
-            if self.is_connected:
-                # Double-check connection is real
-                try:
-                    server_time = self.ib.reqCurrentTime()
-                    if server_time:
-                        connection_verified = True
-                        status_lines.append("✅ Connection Status: CONNECTED (verified)")
-                    else:
-                        status_lines.append("⚠️ Connection Status: ZOMBIE (appears connected but not responding)")
-                except:
-                    status_lines.append("⚠️ Connection Status: ZOMBIE (connection test failed)")
-            else:
-                status_lines.append("❌ Connection Status: DISCONNECTED")
-            
-            if not connection_verified and self.is_connected:
-                status_lines.append("\n⚠️ WARNING: Connection appears broken. Try RECONNECT again.")
-                status_lines.append("If problem persists, restart TWS/Gateway.")
-                status_lines.append("=" * 50)
-                return "\n".join(status_lines)
-            elif not self.is_connected:
-                status_lines.append("\nReconnection failed. Check TWS/Gateway connection.")
-                status_lines.append("=" * 50)
-                return "\n".join(status_lines)
-            
-            # Check data flow (only if connection verified)
-            data_flowing = False
-            current_time = datetime.datetime.now()
-            
-            status_lines.append("\n📊 Market Data Status:")
-            for currency in self.currency_pairs.keys():
-                last_tick = self.last_tick_times.get(currency)
-                if last_tick and (current_time - last_tick).total_seconds() < 60:
-                    data_flowing = True
-                    status_lines.append(f"  {currency}: ✅ Active")
-                else:
-                    status_lines.append(f"  {currency}: ⚠️  No recent data")
-            
-            if data_flowing:
-                status_lines.append("\n💰 Latest Prices:")
-                # Show most recent price for each currency
-                for currency in self.currency_pairs.keys():
-                    if self.recent_prices[currency]:
-                        latest = self.recent_prices[currency][-1]
-                        price_time = latest['time'].strftime("%H:%M:%S")
-                        status_lines.append(
-                            f"  {currency}: {latest['price']:.5f} "
-                            f"(Bid: {latest['bid']:.5f}, Ask: {latest['ask']:.5f}) "
-                            f"@ {price_time}"
-                        )
-                    else:
-                        status_lines.append(f"  {currency}: Waiting for data...")
-                
-                status_lines.append("\n✅ Reconnection successful! Algorithm will continue from last state.")
-            else:
-                status_lines.append("\n⚠️  Connected but no market data flowing yet.")
-                status_lines.append("This could mean markets are closed or data subscriptions need time.")
-                status_lines.append("Try again in 30 seconds if markets should be open.")
-            
-            status_lines.append("=" * 50)
-            
-            result = "\n".join(status_lines)
-            logger.info(result)
-            return result
-            
         except Exception as e:
-            error_msg = f"[RECONNECT] Error during manual reconnection: {e}"
-            logger.error(error_msg, exc_info=True)
-            return error_msg
+            logger.error(f"[RECONNECT] Error during manual reconnection: {e}")
+            import traceback
+            logger.error(f"[RECONNECT] Traceback: {traceback.format_exc()}")
+            return False
 
     def recover_market_data(self, fast_mode=False):
         """Recover market data subscriptions"""
@@ -1610,8 +1609,6 @@ class EnhancedIBTradingBot:
                     
         except Exception as e:
             logger.error(f"[ERROR] Market data recovery failed: {e}")
-
-
 
     def start_command_listener(self):
         """Start command listener thread for runtime commands"""
@@ -1709,7 +1706,7 @@ class EnhancedIBTradingBot:
                                 
                                 # Reconnect with new settings
                                 result = self.handle_manual_reconnect()
-                                logger.info(f"[COMMAND] Switched to LIVE trading mode (Sub-Account: {self.account_id})\n{result}")
+                                logger.info(f"[COMMAND] Switched to LIVE trading mode (Sub-Account: {self.account_id})")
                                 logger.info("[COMMAND] Reconnection initiated for new settings.")
 
                     elif command == "SWITCH_PAPER":
@@ -1728,7 +1725,7 @@ class EnhancedIBTradingBot:
                             
                             # Reconnect with new settings
                             result = self.handle_manual_reconnect()
-                            logger.info(f"[COMMAND] Switched to PAPER trading mode\n{result}")
+                            logger.info(f"[COMMAND] Switched to PAPER trading mode")
                             logger.info("[COMMAND] Reconnection initiated for new settings.")
 
                     elif command.startswith("SET_ORDER_SIZE "):
@@ -1768,13 +1765,17 @@ class EnhancedIBTradingBot:
                         # Connection restart - positions stay in algorithm memory
                         logger.info("[COMMAND] RESTART requested - performing connection restart")
                         try:
-                            # Perform connection restart (same as RECONNECT)
+                            # FIXED: Use the improved manual restart method
                             logger.info("[COMMAND] Performing connection restart...")
-                            self.handle_manual_reconnect()
+                            success = self.handle_manual_reconnect()
                             
-                            # Re-sync positions from algorithm after restart
-                            logger.info("[COMMAND] Re-syncing positions from algorithm...")
-                            self.query_algorithm_positions(force_refresh=True)
+                            if success:
+                                # Re-sync positions from algorithm after restart
+                                logger.info("[COMMAND] Re-syncing positions from algorithm...")
+                                self.query_algorithm_positions(force_refresh=True)
+                                logger.info("[COMMAND] ✅ RESTART completed successfully")
+                            else:
+                                logger.error("[COMMAND] ❌ RESTART failed - see above for details")
                             
                         except Exception as e:
                             logger.error(f"[COMMAND] Failed to perform restart: {e}")
@@ -1990,15 +1991,18 @@ class EnhancedIBTradingBot:
                 # Connection restart - positions stay in algorithm memory
                 logger.info("[HTTP-COMMAND] RESTART requested - performing connection restart")
                 try:
-                    # Perform connection restart (same as RECONNECT)
+                    # FIXED: Use the improved manual restart method
                     logger.info("[HTTP-COMMAND] Performing connection restart...")
-                    reconnect_result = self.handle_manual_reconnect()
+                    success = self.handle_manual_reconnect()
                     
-                    # Re-sync positions from algorithm after restart
-                    logger.info("[HTTP-COMMAND] Re-syncing positions from algorithm...")
-                    positions = self.query_algorithm_positions(force_refresh=True)
+                    if success:
+                        # Re-sync positions from algorithm after restart
+                        logger.info("[HTTP-COMMAND] Re-syncing positions from algorithm...")
+                        positions = self.query_algorithm_positions(force_refresh=True)
+                        return f"✅ RESTART completed successfully - positions synced: {positions}"
+                    else:
+                        return "❌ RESTART failed - connection could not be established. Check TWS/Gateway."
                     
-                    return f"Connection restart completed - positions synced from algorithm: {positions}"
                 except Exception as e:
                     logger.error(f"[HTTP-COMMAND] Failed to perform restart: {e}")
                     return f"Failed to perform restart: {e}"
@@ -2090,6 +2094,13 @@ class EnhancedIBTradingBot:
                 # Reconnection status
                 if self.reconnection_attempts > 0:
                     status_lines.append(f"Reconnection attempts: {self.reconnection_attempts}/{self.max_reconnection_attempts}")
+                
+                # FIXED: Add restart operation status
+                restart_status = self.get_restart_status()
+                if restart_status['restart_in_progress']:
+                    status_lines.append("🔄 RESTART OPERATION IN PROGRESS")
+                if restart_status['restart_lock_locked']:
+                    status_lines.append("🔒 Restart lock is locked")
                 
                 # Tick statistics
                 status_lines.append(f"\nTotal ticks received: {self.total_ticks_received}")
@@ -2405,6 +2416,16 @@ class EnhancedIBTradingBot:
         # Return current cached positions
         with self.position_lock:
             return dict(self.positions)
+
+    def get_restart_status(self):
+        """Get current restart operation status"""
+        return {
+            'restart_in_progress': self.restart_in_progress,
+            'restart_lock_locked': self.restart_lock.locked(),
+            'reconnection_attempts': self.reconnection_attempts,
+            'max_reconnection_attempts': self.max_reconnection_attempts,
+            'persistent_reconnect': self.persistent_reconnect
+        }
 
 if __name__ == "__main__":
     import os
