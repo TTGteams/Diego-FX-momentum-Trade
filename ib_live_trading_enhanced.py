@@ -125,6 +125,10 @@ class EnhancedIBTradingBot:
         self.total_ticks_received = 0
         self.ticks_per_currency = {currency: 0 for currency in self.currency_pairs.keys()}
         
+        # Invalid data tracking for recovery detection
+        self.invalid_data_counts = {currency: 0 for currency in self.currency_pairs.keys()}
+        self.last_valid_data_time = {currency: datetime.datetime.now() for currency in self.currency_pairs.keys()}
+        
         # Market context cache (for frequency optimization)
         self.market_context_cache = {
             'timezone_says_open': False,
@@ -530,10 +534,11 @@ class EnhancedIBTradingBot:
             logger.info("[MARKET_DATA] Testing event handler...")
             try:
                 self.ib.sleep(0.1)  # Let IB process events
-                if hasattr(self.ib, 'pendingTickers') and self.ib.pendingTickers:
-                    logger.info(f"[MARKET_DATA] Found {len(self.ib.pendingTickers)} pending tickers")
+                pending_tickers = self.ib.pendingTickers()  # Fix: Call method, not property
+                if pending_tickers:
+                    logger.info(f"[MARKET_DATA] Found {len(pending_tickers)} pending tickers")
                     # Manually call the handler to test
-                    self.on_pending_tickers(self.ib.pendingTickers)
+                    self.on_pending_tickers(pending_tickers)
                 else:
                     logger.warning("[MARKET_DATA] No pending tickers found - event handler may not be working")
             except Exception as e:
@@ -887,13 +892,17 @@ class EnhancedIBTradingBot:
             logger.info(f"[INFO] IB Message {errorCode}: {errorString}")
 
     def get_midpoint_price(self, ticker) -> Optional[float]:
-        """Calculate midpoint with validation"""
+        """Calculate midpoint with enhanced validation and invalid data detection"""
         try:
+            # Check for IB's invalid data markers (-1 or NaN)
+            if (ticker.bid == -1 or ticker.ask == -1 or 
+                util.isNan(ticker.bid) or util.isNan(ticker.ask)):
+                return None
+                
             if (ticker.bid and ticker.ask and 
-                not util.isNan(ticker.bid) and not util.isNan(ticker.ask) and
                 ticker.bid > 0 and ticker.ask > 0 and ticker.ask > ticker.bid):
                 return (ticker.bid + ticker.ask) / 2.0
-            elif ticker.last and not util.isNan(ticker.last) and ticker.last > 0:
+            elif ticker.last and not util.isNan(ticker.last) and ticker.last > 0 and ticker.last != -1:
                 return ticker.last
             return None
         except Exception as e:
@@ -935,7 +944,21 @@ class EnhancedIBTradingBot:
             
             price = self.get_midpoint_price(ticker)
             if price is None:
+                # Track invalid data for recovery detection
+                self.invalid_data_counts[currency] += 1
+                
+                # Trigger recovery if we get too many invalid ticks in a row
+                if self.invalid_data_counts[currency] >= 10:
+                    time_since_valid = (current_time - self.last_valid_data_time[currency]).total_seconds()
+                    if time_since_valid > 60:  # No valid data for 1 minute
+                        logger.warning(f"[DATA_RECOVERY] {currency} - {self.invalid_data_counts[currency]} invalid ticks, triggering event handler refresh")
+                        threading.Thread(target=self._refresh_event_handler, daemon=True).start()
+                        self.invalid_data_counts[currency] = 0  # Reset counter
                 continue
+                
+            # Reset invalid data counter on valid price
+            self.invalid_data_counts[currency] = 0
+            self.last_valid_data_time[currency] = current_time
                 
             if not self.is_price_reasonable(currency, price):
                 logger.warning(f"[PRICE] {currency} - Unusual price: {price:.5f}")
@@ -1242,10 +1265,18 @@ class EnhancedIBTradingBot:
                 self.market_context_cache.update(new_context)
                 self.market_context_cache['last_updated'] = datetime.datetime.now()
                 
-                # Only log context changes, not every update
+                # Track session transitions and trigger refresh if needed
                 active_sessions = [s['name'] for s in new_context.get('active_sessions', [])]
-                if not hasattr(self, '_last_active_sessions') or self._last_active_sessions != active_sessions:
-                    logger.info(f"[MARKET] Active sessions: {', '.join(active_sessions) or 'All closed'}")
+                if not hasattr(self, '_last_active_sessions'):
+                    self._last_active_sessions = active_sessions
+                elif self._last_active_sessions != active_sessions:
+                    logger.info(f"[MARKET] Session transition: {self._last_active_sessions} → {active_sessions}")
+                    
+                    # Trigger lightweight refresh on major session transitions
+                    if self._is_major_session_transition(self._last_active_sessions, active_sessions):
+                        logger.info("[SESSION_TRANSITION] Major session change detected, refreshing event handler")
+                        threading.Thread(target=self._refresh_event_handler, daemon=True).start()
+                    
                     self._last_active_sessions = active_sessions
                 
                 time.sleep(300)  # 5 minutes
@@ -1578,6 +1609,52 @@ class EnhancedIBTradingBot:
             import traceback
             logger.error(f"[RECONNECT] Traceback: {traceback.format_exc()}")
             return False
+
+    def _refresh_event_handler(self):
+        """Lightweight event handler refresh without full restart"""
+        try:
+            if not self.is_connected or not self.ib.isConnected():
+                return
+                
+            logger.info("[EVENT_REFRESH] Refreshing event handler subscriptions...")
+            
+            # Re-register the event handler
+            self.ib.pendingTickersEvent -= self.on_pending_tickers
+            self.ib.pendingTickersEvent += self.on_pending_tickers
+            
+            # Cancel and re-subscribe to market data for each currency
+            for currency, ticker in self.tickers.items():
+                if ticker:
+                    try:
+                        self.ib.cancelMktData(ticker.contract)
+                        time.sleep(0.1)  # Brief pause
+                        self.ib.reqMktData(ticker.contract, '', False, False)
+                    except Exception as e:
+                        logger.warning(f"[EVENT_REFRESH] Error refreshing {currency}: {e}")
+            
+            logger.info("[EVENT_REFRESH] Event handler refresh complete")
+            
+        except Exception as e:
+            logger.error(f"[EVENT_REFRESH] Error refreshing event handler: {e}")
+
+    def _is_major_session_transition(self, old_sessions, new_sessions):
+        """Detect major session transitions that may cause data flow issues"""
+        # Major sessions that tend to have stable data flow
+        major_sessions = {'New_York', 'London'}
+        
+        # Check if we're transitioning from major to minor sessions
+        old_major = set(old_sessions) & major_sessions
+        new_major = set(new_sessions) & major_sessions
+        
+        # Transition from major session to only minor sessions (like Sydney)
+        if old_major and not new_major and new_sessions:
+            return True
+            
+        # Any significant change in number of active sessions
+        if len(old_sessions) > 1 and len(new_sessions) == 1:
+            return True
+            
+        return False
 
     def recover_market_data(self, fast_mode=False):
         """Recover market data subscriptions"""
@@ -2148,7 +2225,7 @@ class EnhancedIBTradingBot:
                 for currency in self.currency_pairs.keys():
                     # Check ticker data
                     ticker = self.tickers.get(currency)
-                    if ticker and ticker.bid and ticker.ask and not util.isNan(ticker.bid) and not util.isNan(ticker.ask):
+                    if ticker and ticker.bid and ticker.ask and not util.isNan(ticker.bid) and not util.isNan(ticker.ask) and ticker.bid != -1 and ticker.ask != -1:
                         spread = ticker.ask - ticker.bid
                         result_lines.append(f"\n{currency}:")
                         result_lines.append(f"  Bid: {ticker.bid:.5f}")
@@ -2164,7 +2241,11 @@ class EnhancedIBTradingBot:
                         
                         has_any_data = True
                     else:
-                        result_lines.append(f"\n{currency}: No data available")
+                        # Show more detailed invalid data info
+                        if ticker and (ticker.bid == -1 or ticker.ask == -1):
+                            result_lines.append(f"\n{currency}: Invalid data (IB returned -1)")
+                        else:
+                            result_lines.append(f"\n{currency}: No data available")
                 
                 # Add recent price history if available
                 result_lines.append("\n" + "=" * 50)
